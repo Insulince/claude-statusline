@@ -1,8 +1,29 @@
 import sys
 import json
+import shutil
 from datetime import datetime
 
 sys.stdout.reconfigure(encoding="utf-8")
+
+# Bars scale in discrete steps with terminal width (xs/s/m/l/xl) instead of a
+# fixed size, so a wide terminal gets a bit more visual detail without the
+# bars trying to fill all available real estate.
+BAR_WIDTH_BREAKPOINTS = [
+    (190, 6),   # xs - below this, the line is already getting cut off regardless
+    (210, 8),   # s
+    (240, 10),  # m
+    (270, 15),  # l
+    (None, 20), # xl
+]
+
+def scaled_bar_width():
+    try:
+        cols = shutil.get_terminal_size().columns
+    except Exception:
+        cols = 0
+    for max_cols, width in BAR_WIDTH_BREAKPOINTS:
+        if max_cols is None or cols < max_cols:
+            return width
 
 # ── ANSI ──────────────────────────────────────────────────────────────────────
 
@@ -18,6 +39,9 @@ MAGENTA    = "\033[35m"
 BLUE       = "\033[34m"
 WHITE      = "\033[37m"
 SEP     = f"{DIM}{WHITE}│{RESET}"
+
+WEEK_SECONDS  = 7 * 86400
+GRACE_SECONDS = 2 * 3600  # grace window around "on target" before calling it over/under
 
 def c(code, text):
     return f"{code}{text}{RESET}"
@@ -56,6 +80,52 @@ def fmt_relative(epoch):
         return f"{m}m"
     except Exception:
         return "—"
+
+def fmt_duration(seconds):
+    """Format a raw second count (not an epoch) as e.g. '1d22h05m' / '3h12m' / '9m'."""
+    if seconds is None: return "—"
+    neg = seconds < 0
+    seconds = abs(int(seconds))
+    d = seconds // 86400
+    h = (seconds % 86400) // 3600
+    m = (seconds % 3600) // 60
+    if d > 0:   s = f"{d}d{h}h{m:02d}m"
+    elif h > 0: s = f"{h}h{m:02d}m"
+    else:       s = f"{m}m"
+    return ("-" if neg else "") + s
+
+def consumption_status(week_pct, week_reset):
+    """
+    Compares actual time remaining until the 7-day reset against the idealized
+    time the remaining usage budget "should" last if spent at a constant,
+    uniform rate. Also projects the current average burn rate out to the full
+    window. Returns (label, color, eta_str, pace_str) or None if inputs are missing.
+    """
+    if week_pct is None or week_reset is None:
+        return None
+    try:
+        now = datetime.now().timestamp()
+        remaining_actual  = float(week_reset) - now
+        ideal_remaining   = (100 - week_pct) / 100 * WEEK_SECONDS
+        diff              = remaining_actual - ideal_remaining  # >0 means overconsuming
+
+        elapsed_so_far = WEEK_SECONDS - remaining_actual
+        if elapsed_so_far > 0:
+            pace_mult = (week_pct / 100) * WEEK_SECONDS / elapsed_so_far
+            pace_str  = f"{pace_mult:.2f}x"
+        else:
+            pace_str = None
+    except Exception:
+        return None
+
+    if diff > GRACE_SECONDS:
+        return ("overconsuming", RED, f"{fmt_duration(diff)} left", pace_str)
+    if diff < -GRACE_SECONDS:
+        return ("underconsuming", BLUE, "∞", pace_str)
+    # on target (within grace window)
+    if diff >= 0:
+        return ("on target", GREEN, f"{fmt_duration(diff)} left", pace_str)
+    return ("on target", GREEN, "∞", pace_str)
 
 def make_bar(pct, width=24, color_fn=None):
     """Filled/empty block bar, coloured by threshold."""
@@ -97,7 +167,7 @@ def fmt_time(epoch):
         return str(epoch)
 
 def fmt_pct(v):
-    return f"{v:5.1f}%" if v is not None else "  —  "
+    return f"{v:3.0f}%" if v is not None else "  — "
 
 def fmt_ctx_pct(v):
     return f"{v:6.2f}%" if v is not None else "   —  "
@@ -141,7 +211,7 @@ week_reset    = dig(data, "rate_limits", "seven_day", "resets_at")
 print()
 
 # Line 1: model + session stats + context bar (all inline)
-cost_str    = c(cost_color(total_cost), f"${total_cost:5.2f}") if total_cost is not None else c(DIM, "    —")
+cost_str    = c(cost_color(total_cost), f"${total_cost:.2f}") if total_cost is not None else c(DIM, "—")
 cur_usage_vals = [cur_in, cur_out, cur_cache_r, cur_cache_c]
 if any(v is not None for v in cur_usage_vals):
     ctx_tokens = sum(v for v in cur_usage_vals if v is not None)
@@ -154,13 +224,15 @@ else:
 ctx_lbl     = c(WHITE, f"/{ctx_size}") if ctx_size is not None else ""
 tok_str     = (c(pct_color(used_pct), f"{ctx_tokens:6d}") + ctx_lbl) if has_tok else c(WHITE, "     —")
 
-ctx_bar = make_bar(used_pct, width=25)
+bar_width = scaled_bar_width()
+
+ctx_bar = make_bar(used_pct, width=bar_width)
 ctx_pct = c(pct_color(used_pct), fmt_ctx_pct(used_pct))
 
 five_extra = five_pct is not None and five_pct > 100
 week_extra = week_pct is not None and week_pct > 100
 
-def fmt_rate_segment(pct, bar_width=10, dimmed=False):
+def fmt_rate_segment(pct, bar_width=bar_width, dimmed=False):
     """Returns (pct_str, bar). EXTRA (bright red) when pct > 100; dimmed when other window is the binding constraint."""
     if pct is not None and pct > 100:
         return c(BRIGHT_RED, " EXTRA"), c(BRIGHT_RED, "█" * bar_width)
@@ -172,19 +244,28 @@ rate_parts = []
 if five_pct is not None:
     pct_str, bar = fmt_rate_segment(five_pct, dimmed=week_extra and not five_extra)
     rst     = c(WHITE, fmt_relative(five_reset))
-    rst_abs = c(WHITE, fmt_time(five_reset))
-    rate_parts.append(f"5-hour  {pct_str} {bar} ↻ {rst} ({rst_abs})")
+    rst_abs = fmt_time(five_reset)
+    rate_parts.append(f"5-hour  {pct_str} {bar} ↻ {rst} ({c(WHITE, rst_abs)})")
 if week_pct is not None:
     pct_str, bar = fmt_rate_segment(week_pct, dimmed=five_extra and not week_extra)
     rst_rel = c(WHITE, fmt_relative(week_reset))
-    rst_abs = c(WHITE, fmt_epoch(week_reset))
-    rate_parts.append(f"7-day  {pct_str} {bar} ↻ {rst_rel} ({rst_abs})")
+    rst_abs = fmt_epoch(week_reset)
+    rate_parts.append(f"7-day  {pct_str} {bar} ↻ {rst_rel} ({c(WHITE, rst_abs)})")
+
+    consumption = consumption_status(week_pct, week_reset)
+    if consumption is not None:
+        label, color, eta, pace = consumption
+        seg = "Pace  "
+        if pace is not None:
+            seg += f"{c(color, pace)} "
+        seg += f"({c(WHITE, eta)})"
+        rate_parts.append(seg)
 
 rate_str = f"  {SEP}  ".join(rate_parts)
 
 print(f"  {BOLD}{CYAN}{model}{RESET}  {SEP}  "
       f"{cost_str}  {SEP}  "
-      f"ctx  {ctx_pct} {ctx_bar}  {tok_str} tokens"
+      f"ctx  {ctx_pct} {ctx_bar}  {tok_str} tks"
       + (f"  {SEP}  {rate_str}" if rate_str else ""))
 
 print()
