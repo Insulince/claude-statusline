@@ -103,7 +103,14 @@ def consumption_status(week_pct, week_reset):
     Compares actual time remaining until the 7-day reset against the idealized
     time the remaining usage budget "should" last if spent at a constant,
     uniform rate. Also projects the current average burn rate out to the full
-    window. Returns (label, color, eta_str, pace_str) or None if inputs are missing.
+    window. Returns (label, color, eta_str, pace_str) or None if inputs are
+    missing.
+
+    The pace multiplier is a rate (pct / elapsed_so_far) and is hypersensitive
+    right after a window reset, when elapsed_so_far is tiny — below 5% usage
+    it's marked with a '*' (always white/uncolored, regardless of the
+    multiplier's own color) to flag it as noisy/take-with-a-grain-of-salt,
+    since it hasn't had enough elapsed time to stabilize.
     """
     if week_pct is None or week_reset is None:
         return None
@@ -114,11 +121,12 @@ def consumption_status(week_pct, week_reset):
         diff              = remaining_actual - ideal_remaining  # >0 means overconsuming
 
         elapsed_so_far = WEEK_SECONDS - remaining_actual
+        pace_unstable  = week_pct < 5
         if elapsed_so_far > 0:
             pace_mult = (week_pct / 100) * WEEK_SECONDS / elapsed_so_far
-            pace_str  = f"{pace_mult:.2f}x"
+            pace_num  = f"{pace_mult:.2f}x"
         else:
-            pace_str = None
+            pace_num = None
     except Exception:
         return None
 
@@ -132,6 +140,11 @@ def consumption_status(week_pct, week_reset):
     magnitude = fmt_duration(abs(diff))
     label_suffix = c(color, "deficit") if diff > 0 else c(color, "surplus") if diff < 0 else c(color, "on pace")
     eta_str = f"{magnitude} {label_suffix}" if diff != 0 else label_suffix
+
+    if pace_num is not None:
+        pace_str = c(color, pace_num) + (c(WHITE, "*") if pace_unstable else "")
+    else:
+        pace_str = None
 
     return (label, color, eta_str, pace_str)
 
@@ -265,7 +278,7 @@ if week_pct is not None:
         label, color, eta, pace = consumption
         seg = "Pace  "
         if pace is not None:
-            seg += f"{c(color, pace)} "
+            seg += f"{pace} "
         seg += f"({c(WHITE, eta)})"
         rate_parts.append(seg)
 
