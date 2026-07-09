@@ -41,7 +41,11 @@ WHITE      = "\033[37m"
 SEP     = f"{DIM}{WHITE}│{RESET}"
 
 WEEK_SECONDS  = 7 * 86400
-GRACE_SECONDS = 2 * 3600  # grace window around "on target" before calling it over/under
+# Grace window around "on target" before calling it over/under. Asymmetric: being
+# ahead of pace (overconsuming) is worse than being behind (underconsuming), so the
+# window tolerates less slack on the overconsuming side.
+GRACE_OVER_SECONDS  = 12 * 3600
+GRACE_UNDER_SECONDS = 24 * 3600
 
 def c(code, text):
     return f"{code}{text}{RESET}"
@@ -118,14 +122,18 @@ def consumption_status(week_pct, week_reset):
     except Exception:
         return None
 
-    if diff > GRACE_SECONDS:
-        return ("overconsuming", RED, f"{fmt_duration(diff)} left", pace_str)
-    if diff < -GRACE_SECONDS:
-        return ("underconsuming", BLUE, "∞", pace_str)
-    # on target (within grace window)
-    if diff >= 0:
-        return ("on target", GREEN, f"{fmt_duration(diff)} left", pace_str)
-    return ("on target", GREEN, "∞", pace_str)
+    if diff > GRACE_OVER_SECONDS:
+        label, color = "overconsuming", RED
+    elif diff < -GRACE_UNDER_SECONDS:
+        label, color = "underconsuming", BLUE
+    else:
+        label, color = "on target", GREEN  # within grace window
+
+    magnitude = fmt_duration(abs(diff))
+    label_suffix = c(color, "deficit") if diff > 0 else c(color, "surplus") if diff < 0 else c(color, "on pace")
+    eta_str = f"{magnitude} {label_suffix}" if diff != 0 else label_suffix
+
+    return (label, color, eta_str, pace_str)
 
 def make_bar(pct, width=24, color_fn=None):
     """Filled/empty block bar, coloured by threshold."""
@@ -229,12 +237,12 @@ bar_width = scaled_bar_width()
 ctx_bar = make_bar(used_pct, width=bar_width)
 ctx_pct = c(pct_color(used_pct), fmt_ctx_pct(used_pct))
 
-five_extra = five_pct is not None and five_pct > 100
-week_extra = week_pct is not None and week_pct > 100
+five_extra = five_pct is not None and five_pct >= 100
+week_extra = week_pct is not None and week_pct >= 100
 
 def fmt_rate_segment(pct, bar_width=bar_width, dimmed=False):
-    """Returns (pct_str, bar). EXTRA (bright red) when pct > 100; dimmed when other window is the binding constraint."""
-    if pct is not None and pct > 100:
+    """Returns (pct_str, bar). EXTRA (bright red) when pct >= 100; dimmed when other window is the binding constraint."""
+    if pct is not None and pct >= 100:
         return c(BRIGHT_RED, " EXTRA"), c(BRIGHT_RED, "█" * bar_width)
     if dimmed:
         return c(DIM, fmt_pct(pct)), make_bar(pct, width=bar_width, color_fn=lambda v: DIM)
